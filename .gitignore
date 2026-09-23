@@ -1,0 +1,48 @@
+# Build output
+build/
+
+# Generated module image (seed is random per release build)
+packages/dartvmp/generated/
+
+# Generated Dart artifacts (produced by `dart run tool/build.dart`)
+app/lib/generated/
+app/test/generated/
+
+# Desktop test runtime, deployed by tool/build_native.ps1
+app/dartvmp.dll
+
+# Tool package lockfiles are committed per package, not at the root
+
+# Release symbols (produced by `flutter build apk --obfuscate --split-debug-info=build/symbols`)
+app/build/symbols/
+
+# Local tooling leftovers that must never be uploaded: the protection UI writes .bak
+# backups next to the sources it edits, Python leaves caches, and the challenge's
+# derivation step writes a scratch report.
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+
+# The challenge target's own build output (the APK is distributed, not committed)
+*.apk
+*.idsig
+
+# Console/editor noise
+Thumbs.db
+desktop.ini
+
+# Dart/Flutter tool caches and editor state (would otherwise be thousands of files)
+.dart_tool/
+*.iml
+.idea/
+*.log
+
+# Compiler leftovers (an earlier harness build dropped one in the source tree)
+*.obj
+*.o
+*.exe
+*.pdb
+
+# A saved copy of a chat reply, not project documentation. Delete this line to commit it.
+构建.md

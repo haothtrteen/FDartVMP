@@ -1,0 +1,17 @@
+# Store text as LF in the repository, whatever the local checkout does.
+#
+# The sources here are LF (so is the AGPL text in LICENSE, which must stay
+# byte-canonical), and this project is built on Windows. Without this file a
+# checkout with core.autocrlf=true rewrites every text file, so the first real
+# change to any of them shows up as a whole-file diff.
+* text=auto eol=lf
+
+# Real binaries, never touched by the text filters.
+*.png binary
+*.jpg binary
+*.ico binary
+*.so binary
+*.dll binary
+*.apk binary
+*.zip binary
+*.keystore binary

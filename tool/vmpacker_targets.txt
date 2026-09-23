@@ -1,0 +1,78 @@
+# C-layer virtualization targets for VMPacker.
+#
+# One function name per line. `#` starts a comment; blank lines are ignored.
+# `#+name` opens a section selected by the matching switch (`-PcRel`). Everything not
+# marked `!` must exist as a symbol in the unstripped libdartvmp.so -
+# tool/apply_vmpacker.ps1 refuses to run if any name is missing, because a target that
+# has been inlined away or renamed is virtualized silently into nothing.
+#
+# A name prefixed `!` is the opposite: a helper that must NOT exist as its own
+# function, because a virtualized target calls it and an out-of-line copy is a
+# plain-AArch64 version of what the trampoline is hiding. See the helper check in
+# apply_vmpacker.ps1, which fired for real on the first keyed-permutation build.
+#
+# THE LIST IS SHORT BECAUSE OF A DEVICE RESULT, NOT A PREFERENCE
+# -------------------------------------------------------------
+# Seven functions were virtualized, applied cleanly and passed every structural check.
+# Then the protected APK was installed on a real device (rooted Xiaomi 12, Android 13,
+# arm64-v8a) and five of the seven killed it. Per target, tested one at a time:
+#
+#   target                on device        why
+#   --------------------  ---------------  ------------------------------------------
+#   keystream_seed        runs correctly   no calls, no globals - 4 instructions
+#   apply_keystream       runs correctly   79 instructions: immediates, register ops,
+#                                          byte loads/stores and branches only
+#   permute_code          SIGSEGV at 0x0   reads the kWidth[] table via adrp
+#   unpermute_code        SIGSEGV at 0x6dcc bl dvmp_vm_set_error
+#   dvmp_body_tag         SIGSEGV at 0x6d60 bl dvmp_fnv1a64
+#   dvmp_mask_keystream   SIGSEGV          calls dvmp_sha256, and has a local array
+#   code_store_build      SIGSEGV          calls five functions
+#
+# VMPacker 1.3's VM remaps branches *inside* the function it translated and nothing
+# else, so an external `bl` keeps its link-time address and the VM jumps there without
+# adding the library's load bias - which is why the fault address *equals* the call
+# target (0x6d60 and 0x6dcc are the two call targets above, from `llvm-objdump -d`).
+# `adrp`/`adr`/pc-relative loads are the same story for globals.
+#
+# The `#+pcrel` section keeps those five listed rather than deleted, because they are
+# real protection wins the moment the tool can execute them - the opcode mapping, the
+# mask derivation, the store builder - and because the instruction-coverage check in
+# apply_vmpacker.ps1 now refuses them with the offending instruction named. Selecting
+# that section is *expected to fail today*; that failure is the check doing its job.
+#
+# Two more things this cost, both now checked rather than remembered:
+#   * the stack canary. The NDK compiles with -fstack-protector-strong, so any target
+#     with a local array begins with `mrs x19, TPIDR_EL0` / `ldr x8, [x19, #0x28]`, and
+#     VMPacker's VM does not reproduce the TLS read: x19 arrives as zero and the
+#     process dies with "fault addr 0x28" - literally the `#0x28` in that instruction.
+#     DVMP_VMPACKER_TARGET carries no_stack_protector for this reason.
+#   * SIMD. A 256-byte constant fill becomes `movi` + eight `stp q0,q0`, and an inlined
+#     memcpy becomes `ldr q`/`str q`; VMPacker 1.3 has no SIMD translation and refuses
+#     the whole function (that is what `DVMP_NO_BUILTIN` and the scalar SHA-256 state
+#     initialisation in dvmp_sha256.c are for).
+#
+# The three checks around the invocation - target present, helper inlined away,
+# instruction coverage - are what make this list trustworthy. Each was written after
+# watching the failure it catches, and the coverage check fires on every entry in the
+# section below.
+
+# Cold, self-contained, and verified on a device running the protected APK.
+apply_keystream
+keystream_seed
+
+# Helpers that must have been inlined into the two above (or into other functions).
+# `op_tables` is the keyed permutation's construction: while it had a body of its own,
+# the trampolines hid nothing, because an attacker could call it directly.
+!op_tables
+!sm_next
+!sm_init
+
+#+pcrel
+# Translatable, not executable by VMPacker's VM. See the table above: every one of
+# these crashes the application on a device, and each is a target the project wants
+# back as soon as the tool can handle a call or an `adrp`.
+dvmp_body_tag
+permute_code
+unpermute_code
+dvmp_mask_keystream
+code_store_build

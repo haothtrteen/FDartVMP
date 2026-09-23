@@ -1,0 +1,146 @@
+// Android Gradle module for the dartvmp FFI plugin.
+//
+// The Android Gradle Plugin drives the NDK build through `externalNativeBuild`,
+// which is what compiles packages/dartvmp/src into libdartvmp.so and packages it
+// into the APK's lib/<abi>/ directory.
+//
+// The CMake path points at the *core* CMakeLists (../src), which is the single
+// definition of the source list and compile definitions - the Windows plugin
+// build includes the same file, so the two platforms cannot drift.
+group = "com.dartvmp.dartvmp"
+version = "1.0"
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.1")
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    namespace = "com.dartvmp.dartvmp"
+
+    compileSdk = 36
+
+    // Match the NDK the host app is built with, so the plugin does not pin a
+    // second toolchain.
+    ndkVersion = android.ndkVersion
+
+    externalNativeBuild {
+        cmake {
+            path = "../src/CMakeLists.txt"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        minSdk = 24
+
+        // Only the ABIs the runtime has been tested on. 32-bit ARM is deliberately
+        // absent: the interpreter stores pointers in 64-bit slots, and shipping an
+        // untested ABI for a security component is worse than not shipping it.
+        ndk {
+            abiFilters += ["arm64-v8a", "x86_64"]
+        }
+
+        externalNativeBuild {
+            cmake {
+                // Release-tuned code generation even in debug app builds; the
+                // interpreter loop is the hot path and an unoptimised build makes
+                // the demo's benchmark meaningless.
+                //
+                // DVMP_DIAGNOSTICS=OFF drops the probe entry points the test
+                // suite uses, so the shipped libdartvmp.so exports only the
+                // execution ABI. `tool/verify_protection.ps1` asserts this.
+                arguments += [
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DDVMP_DIAGNOSTICS=OFF",
+                    // Instrumentation detection, ON in the shipped build.
+                    //
+                    // It used to be off everywhere, on the reasoning that a developer
+                    // running under a profiler should not be shot in the foot. That
+                    // reasoning applied to the *old* reaction, which was to refuse to
+                    // initialise: a false positive there is an application that will not
+                    // start, so the layer was a liability on a device nobody had tested.
+                    //
+                    // The reaction is now to narrow the decoded-function cache to a
+                    // single slot (see dvmp_code_ensure), which costs an attacker with a
+                    // debugger the ability to see four functions at once and cannot
+                    // change an answer. With the consequences bounded, leaving the
+                    // detection compiled out of the shipped artifact was the wrong
+                    // default.
+                    "-DDVMP_ANTIDEBUG=ON",
+                ]
+
+                // C-layer virtualization hand-off.
+                //
+                // DVMP_VMPACKER=ON gives the declared C targets global symbols in
+                // .symtab so the external tool can find them by name (see
+                // dvmp_vmpacker.h) without exporting them - vmp_exports.map keeps
+                // .dynsym at exactly the nine ABI functions either way.
+                //
+                // It is opt-in, and the reason is worth stating: without the
+                // hand-off the library still builds and still works, it is just
+                // not virtualized. A default that quietly produced a less
+                // protected artifact would be the wrong default, and a default
+                // that required an unobtainable tool would break everyone else's
+                // build. So the switch is explicit, and `tool/test.ps1 -Release`
+                // prints which state the artifact is in rather than leaving it to
+                // be inferred.
+                //
+                // Set with:  flutter build apk --release -Pdvmp.vmpacker=true
+                // (or DVMP_VMPACKER=ON in the environment).
+                def vmpackerOn = project.hasProperty("dvmp.vmpacker") ||
+                        System.getenv("DVMP_VMPACKER") == "ON"
+                if (vmpackerOn) {
+                    arguments += ["-DDVMP_VMPACKER=ON"]
+                    logger.lifecycle("dartvmp: C-layer virtualization hand-off ENABLED")
+                }
+
+                // De-vectorise the cold translation units so VMPacker can translate the
+                // byte-copy loops in dvmp_mask_keystream / code_store_build (the
+                // `#+wide` target set). VMPacker 1.3 has no SIMD translation, and the
+                // SIMD there is the compiler vectorising a little-endian store or an
+                // inlined memcpy. Scoped to dvmp_sha256.c + dvmp_module.c, so the
+                // interpreter keeps its vectorised loops.
+                //
+                // Set with: flutter build apk --release -Pdvmp.vmpacker.novector=true
+                if (project.hasProperty("dvmp.vmpacker.novector") ||
+                        System.getenv("DVMP_VMPACKER_NO_VECTORIZE") == "ON") {
+                    arguments += ["-DDVMP_VMPACKER_NO_VECTORIZE=ON"]
+                    logger.lifecycle("dartvmp: auto-vectorisation DISABLED for the wide VMPacker targets")
+                }
+
+                // The same for the interpreter, which is what the `#+hot` target
+                // (dvmp_vm_run) needs - and it *is* the hot path: a VMPacker-protected
+                // function runs on a second interpreter, so this nests one VM inside
+                // another on every bytecode instruction of every protected call.
+                // Separate switch, and tool/apply_vmpacker.ps1 only asks for that
+                // target with -Hot, so the cost is never paid by accident.
+                //
+                // Set with: flutter build apk --release -Pdvmp.vmpacker.hot=true
+                if (project.hasProperty("dvmp.vmpacker.hot") ||
+                        System.getenv("DVMP_VMPACKER_NO_VECTORIZE_HOT") == "ON") {
+                    arguments += ["-DDVMP_VMPACKER_NO_VECTORIZE_HOT=ON"]
+                    logger.lifecycle("dartvmp: auto-vectorisation DISABLED in the interpreter (hot target)")
+                }
+            }
+        }
+    }
+}

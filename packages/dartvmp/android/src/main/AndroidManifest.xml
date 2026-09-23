@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dartvmp.dartvmp">
+    <!--
+      The plugin ships native code only: no Java/Kotlin, no components, and
+      therefore no exported surface for an attacker to hook into from the app
+      side. Everything reachable is behind the dartvmp_* C ABI.
+    -->
+</manifest>

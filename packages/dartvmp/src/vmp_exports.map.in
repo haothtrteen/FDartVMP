@@ -1,0 +1,58 @@
+/*
+ * vmp_exports.map.in - the complete list of symbols this library exports.
+ * Configured by CMake into vmp_exports.map in the build directory.
+ *
+ * WHY A VERSION SCRIPT AND NOT JUST -fvisibility=hidden
+ * ----------------------------------------------------
+ * A C-layer virtualizer has to be able to *find* the functions it is asked to
+ * protect, which means they have to be global symbols rather than local ones. The
+ * obvious way to do that is `visibility("default")` on each target - and that is
+ * exactly what `DVMP_VMPACKER_TARGET` does. But default visibility alone would
+ * also put those functions into `.dynsym`, i.e. export them:
+ *
+ *     unpermute_code   <- the private instruction set mapping
+ *     apply_keystream  <- the container cipher
+ *     mask_word        <- the static-image mask primitive
+ *
+ * An exported `unpermute_code` is callable by name from a hooking framework, so
+ * publishing it would hand over most of what the bytecode protection rests on -
+ * and `tool/verify_protection.ps1` fails the build when an interpreter internal is
+ * exported, for precisely that reason.
+ *
+ * A version script separates the two questions that `visibility` conflates:
+ * `.symtab` (what a build-time tool can see) and `.dynsym` (what a runtime
+ * attacker can call). Listed here: exported. Not listed here: local to the DSO in
+ * `.dynsym`, and still global in `.symtab` where VMPacker looks.
+ *
+ * It is applied to every ELF build, not only a VMPacker one. Writing the export
+ * surface down has value on its own: before this file, "only the ABI is exported"
+ * was a consequence of a CMake visibility preset that a future edit could quietly
+ * widen, and the check that caught mistakes was a text scan of the built artifact.
+ * Now it is a link-time fact.
+ *
+ * It also fails loudly. The Android toolchain passes `-Wl,--no-undefined-version`,
+ * so listing a symbol that the current configuration does not define is a link
+ * *error* rather than a warning - which is how the diagnostics block below was
+ * caught: a release build compiles those probes out, and the first version of this
+ * file named them unconditionally. The block is therefore emitted by CMake only
+ * when `DVMP_DIAGNOSTICS=ON`, so the export list always describes the build it is
+ * linked into instead of the one it was written for.
+ *
+ * KEEP IN SYNC WITH: the DARTVMP_API block in dartvmp.h, and the expected counts in
+ * tool/verify_protection.ps1 (9 ABI functions, 0 internals).
+ */
+{
+  global:
+    dartvmp_init;
+    dartvmp_call;
+    dartvmp_call_named;
+    dartvmp_function_count;
+    dartvmp_function_info;
+    dartvmp_build_id;
+    dartvmp_status_name;
+    dartvmp_last_error;
+    dartvmp_secure_bytes_live;
+@DVMP_DIAGNOSTIC_EXPORTS@
+  local:
+    *;
+};

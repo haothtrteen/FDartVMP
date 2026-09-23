@@ -1,0 +1,39 @@
+name: dartvmp
+description: >-
+  Dart VMP (Virtual Machine Protection) runtime for Flutter.
+  Provides the FFI bridge to the native private-VM interpreter that executes
+  protected bytecode compiled by the `vmpc` tool.
+version: 0.1.0
+publish_to: 'none'
+repository: https://example.invalid/dartvmp
+
+environment:
+  sdk: ^3.11.4
+  flutter: ">=3.41.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      # Only the platforms that actually have a plugin directory are declared.
+      #
+      # ios, linux and macos used to be listed here with `ffiPlugin: true` and no
+      # `ios/`, `linux/` or `macos/` directory behind them, so the package
+      # advertised support it did not have: `flutter build linux` would configure
+      # a plugin whose CMakeLists does not exist, and Dart would then try to open
+      # a libdartvmp.so that nothing built. `openRuntimeLibrary` has branches for
+      # those platforms so adding one is a matter of adding the directory - but
+      # until then the claim is gone rather than aspirational.
+      android:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true

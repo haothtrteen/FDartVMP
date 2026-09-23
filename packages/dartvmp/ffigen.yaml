@@ -1,0 +1,21 @@
+# Optional: regenerate the FFI bindings with
+#   dart run ffigen --config ffigen.yaml
+#
+# The bindings in lib/src/bindings.dart are hand-maintained so that the package
+# has no codegen dependency at build time. Regenerating is only needed when the
+# public C ABI in src/dartvmp.h changes.
+name: DartVmpBindings
+description: Hand-written FFI bindings for the dartvmp native runtime.
+output: 'lib/src/bindings.dart'
+headers:
+  entry-points:
+    - 'src/dartvmp.h'
+  include-directives:
+    - 'src/dartvmp.h'
+functions:
+  include:
+    - dartvmp_.*
+structs:
+  include:
+    - DartVmpResult
+comments: false
