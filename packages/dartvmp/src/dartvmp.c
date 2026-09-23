@@ -182,6 +182,8 @@ uint32_t dartvmp_integrity_probe(uint32_t *hooked_mask, uint32_t *scanned,
   return dvmp_integrity_probe(hooked_mask, scanned, selftest_ok);
 }
 
+uint32_t dartvmp_wire_probe(uint32_t op) { return dvmp_module_wire_width(op); }
+
 #endif /* DVMP_DIAGNOSTICS */
 
 static int32_t dartvmp_init_locked(const uint8_t *probe, uint32_t probe_len,

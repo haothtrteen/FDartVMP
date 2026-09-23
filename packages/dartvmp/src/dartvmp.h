@@ -328,6 +328,20 @@ DARTVMP_API int32_t dartvmp_sha256_probe(const uint8_t *data, uint32_t len,
                                          uint8_t *out);
 
 /*
+ * Diagnostics only; the operand width the decoder assigns to `op`, or DVMP_OP_MAX
+ * (0x26) when `op` is not an opcode of this build.
+ *
+ * This is the runtime's half of a differential check against the assembler's
+ * `kOperandBytes` (tool/vmpc/lib/src/opcodes.dart), run by
+ * tool/verify_wire_widths.py for every byte 0..255. The two tables have to agree
+ * exactly: they drive the same sequential walk from opposite ends (the assembler emits
+ * the operands, the decoder steps over them), and an opcode added on one side only
+ * makes the decode silently desynchronise rather than fail. Answering DVMP_OP_MAX for a
+ * non-opcode is what lets the check compare the *size* of the opcode set too.
+ */
+DARTVMP_API uint32_t dartvmp_wire_probe(uint32_t op);
+
+/*
  * Reports the instrumentation verdict and the reason for it, and (in a diagnostics
  * build only) forces the verdict so the *reaction* to detection can be tested.
  *

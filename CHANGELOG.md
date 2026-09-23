@@ -8,6 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The Dart package names inside the repository remain `dartvmp` (the runtime) and
 `vmpc` (the compiler); the project name used for these documents is FDartVMP.
 
+## [0.2.0] - 2026-09-23
+
+The C-layer virtualization round. Same day as 0.1.0 and a separate entry on purpose: the
+artifact 0.1.0 describes really did ship with two virtualized functions, and rewriting
+that paragraph would erase the measurement it records.
+
+### Changed
+
+- **The VMPacker target set went from two functions to five.** `dvmp_body_tag`,
+  `permute_code` and `unpermute_code` are now virtualized and verified on the device — by
+  value, not by absence of a crash. Each was moved out of the refused list by removing,
+  from our own source, the construct the tool cannot handle:
+  - `kWidth[]` became `op_width()`, an immediate comparison chain. The table was the only
+    `.rodata` operand in `permute_code` and `adrp` is what VMPacker cannot translate.
+  - `unpermute_code` no longer formats its own error messages: `dvmp_vm_set_error` and its
+    two format strings moved to the caller, which is not a target.
+  - `dvmp_fnv1a64_core` is defined in `dvmp_internal.h` and inlined into `dvmp_body_tag`,
+    with `dvmp_fnv1a64` kept as the out-of-line view of the same loop. VMPacker cannot
+    execute a `bl`.
+  - `DVMP_VMPACKER_NO_VECTORIZE` now compiles the cold translation units with
+    `-mgeneral-regs-only`, which is what actually removes the compiler's SIMD (the
+    SplitMix64 constants came out of a constant pool as `ldr q`). `-fno-vectorize` alone
+    never did: the SIMD came from the loop-idiom, inline-memset and constant-pool paths.
+- **The opcode shuffle no longer uses a remainder.** `r % (256 - i)` compiled to a `CSEL`,
+  and VMPacker 1.3's VM answers that `CSEL` wrongly: a full translation, no crash, and
+  every protected call failing with `opcode 0x20 out of range at +0`. The exact identity
+  `r - ((r + i) >> 8) * (256 - i)` replaces it, and the inverse table is built by two
+  unconditional scatters instead of one conditional one. The Dart side still uses the
+  remainder; both produce the same integer. This is the only failure in the project that
+  no byte-level check could have caught, and it was found by a device bisect
+  (`tool/bisect_vmpacker.ps1`).
+
+### Added
+
+- `tool/verify_wire_widths.py` and the `dartvmp_wire_probe` entry point: the decoder's
+  `op_width()` and the assembler's `kOperandBytes` are compared for all 256 byte values
+  through the runtime's own code, so an opcode added on one side only fails a check
+  instead of silently desynchronising the decode. Runs in `tool/test.ps1`.
+- A **clone check** in `tool/apply_vmpacker.ps1`: any `<target>.something` symbol
+  (`unpermute_code.specialized.1`, `.constprop.0`, `.isra.0`, `.part.0`, `.cold`) is
+  refused, because a clone is the same code left in plain AArch64 beside a trampoline that
+  claims to have replaced it. Reverse-verified against the artifact that had one.
+- `tool/bisect_vmpacker.ps1`: applies VMPacker to a subset of targets, repacks, installs
+  and screenshots, one variant at a time. It is how the `CSEL` was isolated.
+
+### Fixed
+
+- `unpermute_code`'s failure diagnostics are unchanged in content but now come from the
+  caller, and a materialisation failure reports the function and the offending byte.
+
 ## [0.1.0] - 2026-09-23
 
 First public release. This is a working implementation with a closed loop —

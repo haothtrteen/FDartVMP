@@ -13,6 +13,11 @@
 
 #include "dartvmp.h"
 #include "dvmp_wire.h"
+/* For DVMP_ALWAYS_INLINE / DVMP_VMPACKER_TARGET / DVMP_NO_BUILTIN. Included here,
+ * not only in the .c files that mark a target, because `dvmp_fnv1a64_core` below is
+ * declared with DVMP_ALWAYS_INLINE and that macro has to be visible where it is
+ * defined. dvmp_vmpacker.h includes nothing, so there is no cycle. */
+#include "dvmp_vmpacker.h"
 
 /* ------------------------------------------------------------------ */
 /* Secure memory (dvmp_secure.c)                                       */
@@ -314,6 +319,45 @@ int dvmp_map_get(DvmpObj *m, DvmpSlot k, DvmpSlot *out);
 /* Hashes shared with the Dart compiler (dvmp_value.c). The seed parameter
  * makes FNV-1a usable as a keyed MAC for the container auth tag. */
 uint32_t dvmp_crc32(const uint8_t *p, uint32_t n);
+
+#if defined(DVMP_DIAGNOSTICS)
+/*
+ * The decoder's operand width for `op`, or DVMP_OP_MAX when `op` is not one of this
+ * build's opcodes (dvmp_module.c). It exists so tool/verify_wire_widths.py can compare
+ * the runtime's walk against the assembler's `kOperandBytes` for every byte 0..255
+ * instead of comparing two hand-copied tables - the failure it is there to catch is an
+ * opcode added to one side only, which desynchronises the decode silently.
+ */
+uint32_t dvmp_module_wire_width(uint32_t op);
+#endif
+
+/*
+ * FNV-1a, defined inline in this header so `dvmp_body_tag` can absorb it.
+ *
+ * There is exactly one copy of the loop: `dvmp_fnv1a64` is a wrapper around this.
+ * Two copies of a hash that has to agree with `Packer.pack` in Dart bit for bit is
+ * a correctness hazard, not a style question.
+ *
+ * Why it has to be inline *here* rather than just left to the optimiser:
+ * `dvmp_body_tag` is a VMPacker target, and VMPacker 1.3 cannot execute a `bl`
+ * (it keeps the link-time address and does not re-derive it from the load bias, so
+ * the call lands at a fixed, wrong address - measured on device as "fault addr
+ * 0x6d60", which is exactly where `dvmp_fnv1a64` sits in the unslid image). A call
+ * left inside a virtualized function is therefore a crash, not a missed
+ * optimisation. clang emitted the call for both of this function's hash passes
+ * until this was forced.
+ */
+DVMP_ALWAYS_INLINE uint64_t dvmp_fnv1a64_core(const uint8_t *p, uint32_t n,
+                                              uint64_t seed) {
+  uint64_t h = seed;
+  for (uint32_t i = 0; i < n; i++) {
+    h ^= (uint64_t)p[i];
+    h *= 0x100000001B3ull;
+  }
+  return h;
+}
+
+/* The out-of-line entry point, kept for dvmp_host.c and for the host tests. */
 uint64_t dvmp_fnv1a64(const uint8_t *p, uint32_t n, uint64_t seed);
 
 /* ------------------------------------------------------------------ */

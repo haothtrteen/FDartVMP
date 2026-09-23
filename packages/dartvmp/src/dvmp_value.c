@@ -581,10 +581,10 @@ uint32_t dvmp_crc32(const uint8_t *p, uint32_t n) {
 }
 
 uint64_t dvmp_fnv1a64(const uint8_t *p, uint32_t n, uint64_t seed) {
-  uint64_t h = seed;
-  for (uint32_t i = 0; i < n; i++) {
-    h ^= (uint64_t)p[i];
-    h *= 0x100000001B3ull;
-  }
-  return h;
+  /* The loop itself lives in dvmp_internal.h: the VMPacker target `dvmp_body_tag`
+   * has to inline it (a `bl` inside a virtualized function does not survive on
+   * device), and keeping one copy of it here as well would be two definitions of a
+   * hash that must match Dart bit for bit. This symbol is the out-of-line view of
+   * it, kept for dvmp_host.c and for the host tests. */
+  return dvmp_fnv1a64_core(p, n, seed);
 }

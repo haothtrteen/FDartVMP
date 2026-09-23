@@ -107,19 +107,26 @@ VMPacker（github.com/bivex/VMPacker，Go 写的 ARM64 ELF 虚拟化器）通过
 其实并不需要——再编 Go 的 packer），而且**第一次把受保护的 APK 装到真机上跑**。结果是这一节
 最重要的结论：
 
-> **七个被虚拟化的函数里，只有两个能在真机上正确运行；五个让应用在画出第一帧之前 SIGSEGV。
-> 能跑的那两个恰恰是最不值钱的（无调用、无全局变量），而真正该藏的 `unpermute_code` 属于跑不
-> 起来的那一类。**
+> **第一轮实测：七个被虚拟化的函数里，只有两个能在真机上正确运行；五个让应用在画出第一帧之前
+> SIGSEGV。能跑的那两个恰恰是最不值钱的（无调用、无全局变量），而真正该藏的 `unpermute_code`
+> 属于跑不起来的那一类。**
+>
+> **这一轮的后续：那五个里的三个已经救回来了**，方式不是等工具修，而是改我们自己的 C 层——把
+> 调用、`adrp`、SIMD 和 `CSEL` 从目标函数里去掉（见下面的逐条表）。现在默认虚拟化**五个**函数，
+> 含指令流映射本身（`permute_code`/`unpermute_code`）和容器认证标签（`dvmp_body_tag`），并且在
+> 真机上逐个数值核对过。剩下两个（`dvmp_mask_keystream`、`code_store_build`）仍然做不到，
+> 原因是调用——那个得等工具支持。
 
-逐目标实测（root 的小米 12，Android 13，arm64-v8a）：
+逐目标实测（root 的小米 12，Android 13，arm64-v8a；"正确"指屏幕上的数值与 Dart 预言机一致，
+不只是"没崩"）：
 
-| 目标 | 真机 | 原因 |
+| 目标 | 真机 | 原因 / 修法 |
 |---|---|---|
 | `keystream_seed` | 正确 | 4 条指令，无调用、无全局变量 |
 | `apply_keystream` | 正确 | 79 条指令，全是立即数/寄存器/字节读写/分支 |
-| `permute_code` | SIGSEGV `0x0` | 用 `adrp` 读 `kWidth[]` |
-| `unpermute_code` | SIGSEGV `0x6dcc` | `bl dvmp_vm_set_error` |
-| `dvmp_body_tag` | SIGSEGV `0x6d60` | `bl dvmp_fnv1a64` |
+| `permute_code` | 正确 | 原来用 `adrp` 读 `kWidth[]`（`SIGSEGV 0x0`）；表改成 `op_width()` 的立即数比较链，并去掉了 `CSEL` |
+| `unpermute_code` | 正确 | 原来是 `bl dvmp_vm_set_error`（`SIGSEGV 0x6dcc`）；消息改由调用方格式化，`CSEL` 去掉 |
+| `dvmp_body_tag` | 正确 | 原来是 `bl dvmp_fnv1a64`（`SIGSEGV 0x6d60`）；哈希内联（一份实现，两个视图） |
 | `dvmp_mask_keystream` | SIGSEGV | 调用 `dvmp_sha256`，且有局部数组 |
 | `code_store_build` | SIGSEGV | 调用五个函数 |
 
@@ -132,11 +139,24 @@ VM 跳过去时没加加载基址，所以**出错地址等于调用目标**（`
 拒绝。它反向验证过（对真实库确实报，例如 `+0x4428 bl 0x9624 <vmp_secure_alloc>`）。本可以省下
 一台设备、一份 tombstone 和一轮二分。
 
-两个额外代价，都在源码层面修掉了：**栈金丝雀**（NDK 默认 `-fstack-protector-strong`，VM 不复现
+四个额外代价，都在源码层面修掉了，其中前两个是第一轮、后两个是第二轮：
+
+**栈金丝雀**（NDK 默认 `-fstack-protector-strong`，VM 不复现
 `mrs xN, TPIDR_EL0`，于是金丝雀读访问在 `x19=0` 上崩，`fault addr 0x28` 字面上就是那条指令的
-`#0x28`；`DVMP_VMPACKER_TARGET` 因此带 `no_stack_protector`）和 **clang 内联 builtin 产生的 SIMD**
+`#0x28`；`DVMP_VMPACKER_TARGET` 因此带 `no_stack_protector`）；**clang 内联 builtin 产生的 SIMD**
 （`-fno-vectorize` 无效，因为那是 `memset`/`memcpy` 的内联展开；用 `no_builtin` + 标量赋值 +
-scatter 建表解决）。
+scatter 建表解决，而 `-mgeneral-regs-only` 才是真正把常量池那些 `ldr q` 一起干掉的那个开关）；
+**`CSEL`**（见下）；**编译器给目标生成的克隆**（`unpermute_code.specialized.1`）。
+
+`CSEL` 这一条值得单独写清楚，因为它是本轮唯一一个"结构检查全绿、翻译 100%、进程不崩，但**算错**"
+的失败。现象是每个受保护调用都报 `opcode 0x20 out of range at +0`——解码走第一步就拒绝了首字节。
+用 `tool/bisect_vmpacker.ps1` 在真机上二分（三个已知正确的目标 + 一个待测）定位到 `unpermute_code`：
+它比那三个多出来的、且能解释"表算错"的东西就是 `CSEL`（shuffle 里的 `r % (256 - i)` 编译成
+比较+`CSEL`，以及逆表 scatter 里的三目选择）。VMPacker 1.3 的 VM 有 `CSEL` 处理器，所以它"支持"
+这条指令，但对这个形状算错了。修法在我们这边：用恒等式 `r - ((r + i) >> 8) * (256 - i)` 代替取余
+（因为 `i < 38`、`r <= 255`，商恰好等于那个移位），逆表改成两次无条件 scatter。**没有**去改
+VMPacker：对外的流水线必须能用未修改的发布版跑通，否则"可复现"就成了空话；这个 bug 值得上游报，
+最小复现是"唯一的条件指令是 `CSEL`，两个源操作数是 `XZR` 和寄存器"。
 
 能做完、也确实做完了的是交接面和验收，而且每个分支都反向验证过：
 
@@ -148,6 +168,7 @@ scatter 建表解决）。
 | 目标名不存在（被 `-O2` 内联掉） | 前置检查拒绝并指出要用 `-DDVMP_VMPACKER=ON` |
 | 目标里有调用或 `adrp` | 拒绝，并报出指令与偏移 |
 | 目标的辅助函数留在外面 | 拒绝（`op_tables` 曾经就是这样一个函数体） |
+| 目标被编译器克隆出带后缀的副本 | 拒绝（`unpermute_code.specialized.1` 是真的在交付物里出现过一次，反向验证用的就是那份产物） |
 | 只翻译了一部分 | 拒绝：`translated these targets only partially: … 64/70` |
 | 工具退出 0 但**什么都没做** | 后置检查拒绝：逐字节比对目标入口地址前后 |
 | 工具真的改动了 | `RESULT: APPLIED`，导出 ABI 前后都是 9 个 |
@@ -166,15 +187,22 @@ scatter 建表解决）。
    又把它们打回 `t`。二选一，本项目选**不导出**。
 4. **带栈金丝雀的目标不是目标**，见上。
 
-**目标选择也是这轮的结论，而且是缩小而不是扩大**：默认只虚拟化真机验证过的两个
-（`apply_keystream`、`keystream_seed`），其余五个放在 `#+pcrel` 段里、由上述检查拒绝。
+**目标选择两轮下来是"先缩小、再扩大"，而且每一次扩大都有真机数值做依据**：第一轮默认只虚拟化
+真机验证过的两个（`apply_keystream`、`keystream_seed`），其余五个放在 `#+pcrel` 段里、由上述检查
+拒绝；第二轮把 `dvmp_body_tag`、`permute_code`、`unpermute_code` 挪进默认段——不是因为想让数字
+好看，而是因为去掉调用 / `adrp` / SIMD / `CSEL` 之后它们确实在真机上算对了（逐个数值与 Dart
+预言机核对过）。剩下两个仍在 `#+pcrel`。
 **不碰** `dvmp_vm_run` 和 `dvmp_code_ensure`——受保护函数跑在第二台解释器上，把内层循环虚拟化
 等于在系统最热的路径上套一层 VM；而且实测它连翻译都过不去（`1029/1053`，剩下 24 条是 SIMD 寄存器
 里的 16 字节结构体拷贝）。
 
-**对 L5 的诚实交代**：这一层没有被解决。C 层虚拟化现在只覆盖两个"藏了也几乎不值钱"的函数，
-解释器本身仍然是可读的 AArch64，所以"读 `dvmp_vm.c` 就知道每个 opcode 干什么"这条路径完全没变。
-私有指令集映射的保护来自第 7 项（关键化随机置换），不是来自这一层。
+**对 L5 的诚实交代**：这一层没有被解决。C 层虚拟化现在覆盖五个函数，其中包括**指令流映射本身**
+（`permute_code`/`unpermute_code`）和**容器认证标签**（`dvmp_body_tag`）——这两样以前是明文
+AArch64，现在必须跑 VMPacker 的 VM 才能算出来，所以"读一下反汇编就知道映射怎么来的"这条路径确实
+变贵了（`tool/recover_opcodes.py` 那个 28500 次仿射候选的攻击早就失效，而现在的答案是"要么实现
+这个置换、要么逆 VM 的字节码"）。但**解释器本身仍然是可读的 AArch64**，所以"读 `dvmp_vm.c` 就
+知道每个 opcode 干什么"这条路径完全没变；私有指令集的保密性仍然主要来自第 7 项（关键化随机置换）
+和 C 层 VM 的逆向成本，而不是来自"C 层没有明文"。这是**提高成本**，不是**阻止**。
 
 ---
 

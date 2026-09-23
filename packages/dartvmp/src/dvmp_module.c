@@ -132,23 +132,64 @@ DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET uint64_t keystream_seed(uint64_t seed
 DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET uint64_t dvmp_body_tag(
     const uint8_t *body, uint32_t body_len,
                               uint64_t seed) {
-  uint64_t h = dvmp_fnv1a64(body, body_len, 0xCBF29CE484222325ull);
+  /* Inline, not a call: see dvmp_fnv1a64_core in dvmp_internal.h - VMPacker cannot
+   * execute a `bl`, so a call left here crashes the virtualized function. */
+  uint64_t h = dvmp_fnv1a64_core(body, body_len, 0xCBF29CE484222325ull);
   uint8_t tail[8];
   const uint64_t t = seed ^ 0x5DEECE66Dull;
   for (int i = 0; i < 8; i++) {
     tail[i] = (uint8_t)((t >> (8 * i)) & 0xFF);
   }
-  h = dvmp_fnv1a64(tail, 8, h);
+  h = dvmp_fnv1a64_core(tail, 8, h);
   return h ^ (seed * 0x100000001B3ull);
 }
 
-/* Operand width of each opcode in the *decoded* instruction set. */
-static const uint8_t kWidth[DVMP_OP_MAX] = {
-    0, 4, 2, 2, 0, 0, 0, 0, 0, 0, /* 00..09 */
-    2, 2, 0, 0, 0, 0, 0, 0, 0, 0, /* 0A..13 */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 14..1D */
-    4, 4, 4, 2, 0, 0, 4, 0,       /* 1E..25 */
-};
+/*
+ * Operand width of each opcode in the *decoded* instruction set.
+ *
+ * A comparison chain rather than the `static const uint8_t kWidth[]` table this
+ * used to be, and the reason is a VMPacker constraint rather than speed: a table in
+ * .rodata is reached through `adrp` + `add`, and VMPacker 1.3 translates neither
+ * (measured: `permute_code` came back as "Translated: 94/118" with 8 `adrp`s, and
+ * the virtualized version faulted at address 0 on device). Immediates translate
+ * fine, so the width is recomputed instead of looked up. That also takes
+ * `unpermute_code`'s last .rodata operand with it.
+ *
+ * The widths are the same ones `tool/walk_bytecode.py` and `tool/audit_operands.py`
+ * mirror on the Python side and the ones the Dart assembler emits; the values are
+ * checked against the assembler by tool/test.ps1 (see op_width_matches_assembler).
+ */
+DVMP_ALWAYS_INLINE uint32_t op_width(uint32_t op) {
+  if (op == DVMP_OP_PUSH_I) return 4u;                          /* s32 imm   */
+  if (op == DVMP_OP_JMP || op == DVMP_OP_JMP_IF_FALSE ||        /* s32 tgt   */
+      op == DVMP_OP_JMP_IF_TRUE) {
+    return 4u;
+  }
+  if (op == DVMP_OP_HOST) return 4u;                            /* u32 id    */
+  if (op == DVMP_OP_PUSH_K || op == DVMP_OP_PUSH_S ||           /* u16 idx   */
+      op == DVMP_OP_LOAD || op == DVMP_OP_STORE ||
+      op == DVMP_OP_CALL) {
+    return 2u;
+  }
+  return 0u;
+}
+
+#if defined(DVMP_DIAGNOSTICS)
+/*
+ * The decoder's width table, exposed for the differential check against the
+ * assembler's `kOperandBytes` in tool/vmpc/lib/src/opcodes.dart.
+ *
+ * `DVMP_OP_MAX` doubles as the "not an opcode" value everywhere else in this file,
+ * so it is the sentinel here too: a byte that is not one of this build's opcodes has
+ * no width, and saying so explicitly (rather than returning 0) is what lets
+ * tool/verify_wire_widths.py check the *size of the opcode set* against the Dart
+ * list instead of only the widths inside it. An opcode added on one side only now
+ * fails a check rather than desynchronising the walk at runtime.
+ */
+uint32_t dvmp_module_wire_width(uint32_t op) {
+  return op < (uint32_t)DVMP_OP_MAX ? op_width(op) : (uint32_t)DVMP_OP_MAX;
+}
+#endif /* DVMP_DIAGNOSTICS */
 
 /*
  * The opcode permutation: a keyed Fisher-Yates shuffle of the byte range 0..255,
@@ -205,7 +246,27 @@ DVMP_ALWAYS_INLINE void op_tables(uint64_t seed, uint8_t *perm, uint8_t *inv) {
     word >>= 8;
     have--;
 
-    const uint32_t j = i + (r % (256u - i));
+    /*
+     * `i + (r % (256 - i))`, written as a shift and a multiply rather than as a
+     * remainder.
+     *
+     * This is not a micro-optimisation, it is a correctness requirement for the
+     * VMPacker build. The remainder compiles to a comparison feeding a `CSEL`
+     * (clang proves the quotient is at most 1, since r <= 255 < 2 * (256 - i)), and
+     * VMPacker 1.3's VM computes that CSEL wrongly: with `unpermute_code`
+     * virtualized, every protected call fails on a device with
+     * "opcode 0x20 out of range at +0" - the shuffle produces a different
+     * permutation from the one the Dart assembler used. Measured, not inferred; the
+     * bisect and the screenshots are recorded in tool/vmpacker_targets.txt.
+     *
+     * The identity is exact, not an approximation:
+     *     r % (256 - i) == r - q * (256 - i),  q = (r + i) >> 8
+     * because i < DVMP_OP_MAX (38) and r <= 255 give r + i <= 292 < 512, so
+     * (r + i) >> 8 is 1 exactly when r + i >= 256, i.e. exactly when r >= 256 - i.
+     * The Dart side keeps the plain remainder; the two produce the same integer.
+     */
+    const uint32_t q = (r + i) >> 8;
+    const uint32_t j = i + r - q * (256u - i);
     const uint8_t t = pool[i];
     pool[i] = pool[j];
     pool[j] = t;
@@ -231,9 +292,19 @@ DVMP_ALWAYS_INLINE void op_tables(uint64_t seed, uint8_t *perm, uint8_t *inv) {
    * loop: `perm` and `inv` are two views of one shuffle. `inv == NULL` in
    * `permute_code`, where the constant folds the whole thing away. */
   if (inv != NULL) {
+    /*
+     * Two scatters rather than one conditional scatter, for the same VMPacker
+     * reason as the shuffle above: `i < DVMP_OP_MAX ? i : DVMP_OP_MAX` is a second
+     * CSEL, and one CSEL in a virtualized function is already enough to make the
+     * table wrong on a device. Both loops store through a data-dependent index, so
+     * neither can become a memset or be vectorised - which is the other property
+     * this table has to keep (see the note above).
+     */
     for (uint32_t i = 0; i < 256u; i++) {
-      inv[pool[i]] =
-          (i < (uint32_t)DVMP_OP_MAX) ? (uint8_t)i : (uint8_t)DVMP_OP_MAX;
+      inv[pool[i]] = (uint8_t)DVMP_OP_MAX;
+    }
+    for (uint32_t i = 0; i < (uint32_t)DVMP_OP_MAX; i++) {
+      inv[perm[i]] = (uint8_t)i;
     }
   }
 }
@@ -264,14 +335,26 @@ DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET void permute_code(uint8_t *code,
     /* Out-of-range bytes are copied through untouched and stepped over one byte
      * at a time. That is deliberate: it keeps this function total (no branch out
      * of a table) and it means the *inverse* is where a corrupt stream is caught,
-     * since `unpermute_code` is the one that has to produce something executable. */
+     * since `unpermute_code` is the one that has to produce something executable.
+     * `op_width` returns 0 for every byte that is not an opcode, which is exactly
+     * what the old `op < DVMP_OP_MAX ? kWidth[op] : 0` expressed. */
     if (op < DVMP_OP_MAX) code[pc] = perm[op];
-    pc += 1u + (op < DVMP_OP_MAX ? kWidth[op] : 0u);
+    pc += 1u + op_width(op);
   }
 }
 
+/*
+ * The inverse walk. `bad_at` / `bad_byte` are optional (either may be NULL) and are
+ * written only on failure, because the diagnostics have to be produced by the
+ * *caller*: this function is a VMPacker target, and formatting a message here would
+ * mean a `bl dvmp_vm_set_error` plus the two format strings' `adrp`s, all three of
+ * which VMPacker 1.3 either cannot translate or cannot execute.
+ *
+ * Returns 0 on success, -1 for an out-of-range opcode, -2 for a stream that does
+ * not end exactly on code_len.
+ */
 DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET int unpermute_code(uint8_t *code,
-    uint32_t code_len, uint64_t seed) {
+    uint32_t code_len, uint64_t seed, uint32_t *bad_at, uint8_t *bad_byte) {
   uint8_t perm[DVMP_OP_MAX];
   uint8_t inv[256];
   op_tables(seed, perm, inv);
@@ -281,16 +364,16 @@ DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET int unpermute_code(uint8_t *code,
     const uint8_t wire = code[pc];
     const uint8_t op = inv[wire];
     if (op >= DVMP_OP_MAX) {
-      dvmp_vm_set_error("opcode 0x%02x out of range at +%u", wire, pc);
+      if (bad_at != NULL) *bad_at = pc;
+      if (bad_byte != NULL) *bad_byte = wire;
       return -1;
     }
     code[pc] = op;
-    pc += 1u + kWidth[op];
+    pc += 1u + op_width(op);
   }
   if (pc != code_len) {
-    dvmp_vm_set_error("instruction stream overran its buffer (%u of %u)", pc,
-                      code_len);
-    return -1;
+    if (bad_at != NULL) *bad_at = pc;
+    return -2;
   }
   return 0;
 }
@@ -631,7 +714,27 @@ const uint8_t *dvmp_code_ensure(uint32_t func, uint32_t code_off,
    * failed walk, which is why this returns NULL rather than executing whatever
    * came out.
    */
-  if (unpermute_code(s->buf, code_len, m->code_salt) != 0) {
+  uint32_t bad_at = 0;
+  uint8_t bad_byte = 0;
+  const int urc =
+      unpermute_code(s->buf, code_len, m->code_salt, &bad_at, &bad_byte);
+  if (urc != 0) {
+    /*
+     * Both out-parameters are passed here for a reason that is not diagnostics: the
+     * other caller passes real pointers too, and a caller that passed NULL made clang
+     * clone this function (`unpermute_code.specialized.1`, constant-propagating the
+     * NULL checks away). A clone is a second, plain-AArch64 copy of exactly what the
+     * trampoline is hiding - the same failure `!op_tables` exists to catch - so the
+     * two call sites are kept identical in shape. `tool/apply_vmpacker.ps1` refuses a
+     * build whose target symbols have `.specialized`/`.constprop` clones.
+     */
+    if (urc == -1) {
+      dvmp_vm_set_error("function %u: opcode 0x%02x out of range at +%u", func,
+                        bad_byte, bad_at);
+    } else {
+      dvmp_vm_set_error("function %u: instruction stream overran its buffer (%u of %u)",
+                        func, bad_at, code_len);
+    }
     s->func = DVMP_CODE_NOFUNC;
     s->len = 0;
     vmp_secure_wipe(s->buf, s->cap);
@@ -950,7 +1053,19 @@ DVMP_VMPACKER_LINKAGE DVMP_VMPACKER_TARGET int32_t module_open_locked(void) {
       vmp_secure_wipe(m->body, body_len);
       return DARTVMP_ERR_MODULE_CORRUPT;
     }
-    if (unpermute_code((uint8_t *)(uintptr_t)code, code_len, seed) != 0) {
+    uint32_t bad_at = 0;
+    uint8_t bad_byte = 0;
+    const int urc = unpermute_code((uint8_t *)(uintptr_t)code, code_len, seed,
+                                   &bad_at, &bad_byte);
+    if (urc != 0) {
+      /* The message is formatted here, in a translation unit that is not a
+       * VMPacker target: `unpermute_code` itself must stay call-free. */
+      if (urc == -1) {
+        dvmp_vm_set_error("opcode 0x%02x out of range at +%u", bad_byte, bad_at);
+      } else {
+        dvmp_vm_set_error("instruction stream overran its buffer (%u of %u)",
+                          bad_at, code_len);
+      }
       vmp_secure_wipe(m->body, body_len);
       return DARTVMP_ERR_MODULE_CORRUPT;
     }

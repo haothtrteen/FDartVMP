@@ -321,43 +321,75 @@ is *read the bytecode*, and that used to be cheap because `dvmp_vm.c` compiles t
 readable switch that states each opcode's semantics. This item was supposed to close that
 step. It closes part of it, and the honest summary is uncomfortable:
 
-**The virtualization works for the two functions that are worth the least, and cannot be
-applied to the ones that matter.** Seven functions were virtualized, applied cleanly, and
-passed every structural check. Then the protected APK was installed on a rooted Xiaomi 12
-(Android 13, arm64-v8a) and five of the seven killed it. Tested one target at a time:
+**The first device run made it work for the two functions that are worth the least. The
+second one brought back three of the five that matter.** Seven functions were virtualized,
+applied cleanly, and passed every structural check. Then the protected APK was installed on
+a rooted Xiaomi 12 (Android 13, arm64-v8a) and five of the seven killed it. Tested one
+target at a time — and then fixed, in our C layer, one limitation at a time:
 
-| Target | On device | Why |
+| Target | On device | Why / what changed |
 |---|---|---|
 | `keystream_seed` | **runs correctly** | no calls, no globals — 4 instructions |
 | `apply_keystream` | **runs correctly** | 79 instructions: immediates, register moves, byte loads/stores, branches |
-| `permute_code` | SIGSEGV at `0x0` | reads the `kWidth[]` table via `adrp` |
-| `unpermute_code` | SIGSEGV at `0x6dcc` | `bl dvmp_vm_set_error` |
-| `dvmp_body_tag` | SIGSEGV at `0x6d60` | `bl dvmp_fnv1a64` |
+| `permute_code` | **runs correctly** | died at `0x0` on the `kWidth[]` table's `adrp`; the table is now `op_width()`, a comparison chain over immediates (and its `CSEL` had to go too) |
+| `unpermute_code` | **runs correctly** | died at `0x6dcc`, the address of `bl dvmp_vm_set_error`; the message is formatted by the caller now |
+| `dvmp_body_tag` | **runs correctly** | died at `0x6d60`, the address of `bl dvmp_fnv1a64`; the hash is inlined (one definition, two views) |
 | `dvmp_mask_keystream` | SIGSEGV | calls `dvmp_sha256`; also has a local array |
 | `code_store_build` | SIGSEGV | calls five functions |
 
-The fault addresses are the diagnosis. VMPacker 1.3's VM remaps branches *inside* the
-function it translated and nothing else, so an external `bl` keeps its link-time address
-and the VM jumps there without adding the library's load bias — which is why the fault
-address **equals the call target**: `llvm-objdump -d` puts `dvmp_fnv1a64` at `0x6d60` and
-`dvmp_vm_set_error` at `0x6dcc`, and those are exactly the two addresses the process died
-on. `adrp`/`adr`/pc-relative loads are the same story for globals, which is why
-`permute_code` — which calls nothing at all — still dies.
+"Runs correctly" means the values, not the absence of a crash: the APK was launched,
+screenshotted, and every figure on the demo card checked against the Dart oracle —
+`add(20,22)=42`, `makeLicenseKey("demo-seed",7)=ZVEXKFVVCDH93W6R`, `verifyLicense` true for
+the good key and false for the altered one, `deviceToken("pixel-7",1700000000)=
+-5031510683369134119`, `selfTest()=true`. Those calls are dispatched through the
+trampolines, and the module cannot open at all unless `dvmp_body_tag`, `permute_code` and
+`unpermute_code` compute exactly what the Dart assembler computed. The suite's device step
+only proves "no crash record", which is why this was checked by eye as well.
 
-So `tool/vmpacker_targets.txt` now lists two targets, and the five that would need a call
-or an `adrp` sit in a `#+pcrel` section that the new **instruction-coverage check** in
-`tool/apply_vmpacker.ps1` refuses by name and offset. That check is the durable artifact
-of this item: it catches in a second what took a device, a tombstone and a bisect to find.
-It is reverse-verified — it fires on the real library, with `+0x4428 bl 0x9624
+The fault addresses were the diagnosis for the first three. VMPacker 1.3's VM remaps
+branches *inside* the function it translated and nothing else, so an external `bl` keeps
+its link-time address and the VM jumps there without adding the library's load bias — which
+is why the fault address **equals the call target**: `llvm-objdump -d` puts `dvmp_fnv1a64`
+at `0x6d60` and `dvmp_vm_set_error` at `0x6dcc`, and those are exactly the two addresses
+the process died on. `adrp`/`adr`/pc-relative loads are the same story for globals, which
+is why `permute_code` — which calls nothing at all — died at `0x0`.
+
+The fourth one had no fault address at all, and it is the interesting one. With calls,
+`adrp` and SIMD gone, all five targets translated in full, the APK installed, the process
+stayed up — and every protected call failed with `opcode 0x20 out of range at +0`: the
+decode walk rejecting the first byte of the instruction stream. A device bisect
+(`tool/bisect_vmpacker.ps1`, one target added at a time) put it on `unpermute_code`, and
+comparing its disassembly against the three targets that worked pointed at `CSEL`: present
+twice there (the shuffle's `r % (256 - i)`, and the `i < DVMP_OP_MAX ? i : DVMP_OP_MAX`
+select in the inverse-table scatter) and absent from all three working targets. VMPacker's
+VM has a `CSEL` handler, so the instruction is "supported" — it answers wrongly. The fix is
+in our source rather than in the tool, because the pipeline has to stay reproducible with
+the unmodified release: the shuffle uses an exact identity instead of a remainder
+(`r - ((r + i) >> 8) * (256 - i)`, valid because `i < 38` and `r <= 255` make the quotient
+exactly that shift) and the inverse table is built by two unconditional scatters instead of
+one conditional one. This is the one failure in this project that no byte-level check could
+have caught: it translates 100% and runs without crashing, and the only signal is a number
+that is wrong.
+
+So `tool/vmpacker_targets.txt` now lists five targets; the two that would still need a call
+sit in a `#+pcrel` section that the **instruction-coverage check** in
+`tool/apply_vmpacker.ps1` refuses by name and offset. That check is the durable artifact of
+the first round: it catches in a second what took a device, a tombstone and a bisect to
+find. It is reverse-verified — it fires on the real library, with `+0x4428 bl 0x9624
 <vmp_secure_alloc>` and `+0x4590 adrp x0, ...` for `code_store_build`.
 
-**What the two surviving targets are worth: not much, and the README should say so.**
-`apply_keystream` is SplitMix64 keyed by the seed in the container header, and
-`keystream_seed` is `seed ^ 0xA5A5…`. Both are documented above, in this file, in enough
-detail to reimplement. Virtualizing them costs an attacker the ten minutes it takes to
-write those two functions. The function that *would* have been worth hiding — `unpermute_code`, the private opcode mapping — is the one with a call in it, and it
-cannot be virtualized with this tool at all. Item 7 is what actually protects the mapping;
-this item protects its own inverse's inverse.
+**What the five surviving targets are worth: more than the two were, and still not the
+interpreter.** `apply_keystream` is SplitMix64 keyed by the seed in the container header,
+and `keystream_seed` is `seed ^ 0xA5A5…`; both are documented above, in this file, in
+enough detail to reimplement, so virtualizing them costs an attacker the ten minutes it
+takes to write those two functions. The three that came back are a different kind of
+target: `permute_code` and `unpermute_code` are the private opcode mapping itself, and
+`dvmp_body_tag` is the container's authentication tag. Recovering any of them now means
+either reimplementing the construction or inverting VMPacker's bytecode — the disassembly
+route that used to answer "how is the mapping derived" in an afternoon is gone. What has
+*not* changed is the layer underneath: `dvmp_vm.c` is still readable AArch64, so "read the
+interpreter and you know what each opcode does" is exactly as cheap as it was. Item 7 is
+still what protects the mapping's secrecy; this item raises the cost of the other route.
 
 The rest of this item is the record of how the three checks around the invocation were
 built, because they are what makes the target list trustworthy, and each was written after
@@ -978,9 +1010,10 @@ The tool for that is [VMPacker](https://github.com/bivex/VMPacker), an ARM64 ELF
 virtualizer. It is built from source locally — `tool/build_vmpacker.ps1` compiles the VM
 interpreter stub with the NDK's clang/ld.lld/objcopy (the `aarch64-linux-gnu-` toolchain
 its Makefile expects turned out not to be needed) and then the Go packer — and applied by
-`tool/apply_vmpacker.ps1`. **Two functions are virtualized and verified on a device; five
-are refused by a check, because the tool translates them and they then crash.** The
-per-target evidence, the fault addresses and the reasoning are in item 1 of
+`tool/apply_vmpacker.ps1`. **Five functions are virtualized and verified on a device — by
+value, not by absence of a crash; two are refused by a check, because the tool translates
+them and they then crash.** The per-target evidence, the fault addresses, the `CSEL` that
+answered wrongly and the reasoning are in item 1 of
 [What was strengthened](#what-was-strengthened-and-what-was-deliberately-not); this
 section is about the hand-off itself.
 
@@ -1032,16 +1065,22 @@ build around an unprotected library:
    `-fstack-protector-strong`, and VMPacker's VM does not reproduce the TLS read that loads
    the canary, so `DVMP_VMPACKER_TARGET` carries `no_stack_protector`. See item 1.
 
-The target list is the other half of the design, and it is now two entries rather than
+The target list is the other half of the design, and it is now five entries rather than
 eight:
 
 ```
-virtualized, verified on device   apply_keystream, keystream_seed
-refused: needs a call or an adrp  dvmp_body_tag, permute_code, unpermute_code,
-                                  dvmp_mask_keystream, code_store_build
+virtualized, verified on device   apply_keystream, keystream_seed, dvmp_body_tag,
+                                  permute_code, unpermute_code
+refused: needs a call             dvmp_mask_keystream, code_store_build
 not a target, by design           dvmp_vm_run (the instruction loop)
                                   dvmp_code_ensure (called once per instruction)
 ```
+
+The three in the middle of that first line are the second round's work: each was moved out
+of the refused list by removing the construct VMPacker cannot handle from *our* source - a
+call, an `adrp`, SIMD register traffic, and finally a `CSEL` that was not a crash but a
+wrong answer. `tool/vmpacker_targets.txt` is where that record lives, and the table in
+item 1 above is the part of it that a reader should not have to reconstruct.
 
 A VMPacker-protected function runs on a *second* interpreter, so the cost is per call, and
 the interpreter loop is the one function that must not go in: it would nest one VM inside

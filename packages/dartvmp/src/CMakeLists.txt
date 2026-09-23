@@ -27,21 +27,32 @@ option(DVMP_DIAGNOSTICS "Export the diagnostic probe symbols" ON)
 # vmp_exports.map. See dvmp_vmpacker.h and tool/apply_vmpacker.ps1. Off by default
 # because it requires the external tool to be present and is meaningless without it.
 option(DVMP_VMPACKER "Mark the C-layer virtualization targets for VMPacker" OFF)
-# Stop the compiler vectorising the byte copies in the *cold* translation units, so
-# VMPacker can translate the functions that contain them (`#+wide` in
+# Stop the compiler emitting *any* FP/SIMD register traffic in the cold translation
+# units, so VMPacker can translate the functions that contain it (`#+wide` in
 # tool/vmpacker_targets.txt: dvmp_mask_keystream and code_store_build). VMPacker 1.3
-# has no SIMD translation, and the SIMD here is the compiler vectorising a
-# little-endian keystream store and an inlined memcpy.
+# has no SIMD translation, and the SIMD here is compiler-generated, not source-level:
+# vectorising a little-endian keystream store, inlining a memcpy, materialising the
+# SplitMix64 constants out of a constant pool with `ldr q`, and the 256-byte
+# constant fill that becomes `movi v0.16b, #0xff` + eight `stp q0, q0`.
+#
+# The flag that actually delivers this is -mgeneral-regs-only, and -fno-vectorize is
+# not a substitute for it: -fno-vectorize does not disable the loop-idiom /
+# inline-memset / constant-pool paths, and all four of the SIMD cases above survived
+# it. -mgeneral-regs-only forbids the compiler from using FP/SIMD registers at all,
+# so the constants come out as scalar `movz`/`movk` and the fill as `strb`. It is
+# safe here because the runtime contains no floating point whatsoever (no `double`,
+# no `float`, no HFA struct) - checked in tool/verify_build_flags.py - so the AAPCS64
+# argument/return convention it changes is never exercised.
 #
 # Scoped to dvmp_sha256.c and dvmp_module.c on purpose: those two hold the container's
 # front door and are entered once per open, so de-vectorising them costs nothing
 # measurable, while leaving dvmp_vm.c - the interpreter loop, the hottest code in the
-# system - vectorised.
-option(DVMP_VMPACKER_NO_VECTORIZE "Disable auto-vectorisation in the cold translation units so VMPacker can translate the wide target set" OFF)
+# system - with its vectorised loops.
+option(DVMP_VMPACKER_NO_VECTORIZE "Disable FP/SIMD register use in the cold translation units so VMPacker can translate the wide target set" OFF)
 # The same for dvmp_vm.c, which is only needed for the `#+hot` target (dvmp_vm_run:
 # the interpreter itself). Separate because that one *is* the hot path - see
 # tool/vmpacker_targets.txt.
-option(DVMP_VMPACKER_NO_VECTORIZE_HOT "Also disable auto-vectorisation in the interpreter, so VMPacker can translate dvmp_vm_run" OFF)
+option(DVMP_VMPACKER_NO_VECTORIZE_HOT "Also disable FP/SIMD register use in the interpreter, so VMPacker can translate dvmp_vm_run" OFF)
 
 # Sources are listed as absolute paths: Flutter adds plugin directories as
 # symlinks (windows/flutter/ephemeral/.plugin_symlinks/...), and a relative
@@ -167,15 +178,21 @@ if(DVMP_VMPACKER_NO_VECTORIZE OR DVMP_VMPACKER_NO_VECTORIZE_HOT)
   else()
     # Per-source rather than target-wide: see the option definitions above for why the
     # interpreter keeps its vectorised loops unless -Hot is asked for explicitly.
+    #
+    # -mgeneral-regs-only is the load-bearing flag; -fno-vectorize is kept because it
+    # also stops the deliberate loop vectoriser, and the two together are what the
+    # "no SIMD at all in these objects" assertion in tool/apply_vmpacker.ps1 checks.
     if(DVMP_VMPACKER_NO_VECTORIZE)
       set_source_files_properties(
         "${DVMP_ROOT}/dvmp_sha256.c" "${DVMP_ROOT}/dvmp_module.c"
-        PROPERTIES COMPILE_OPTIONS "-fno-vectorize;-fno-slp-vectorize")
+        PROPERTIES COMPILE_OPTIONS
+        "-fno-vectorize;-fno-slp-vectorize;-mgeneral-regs-only")
     endif()
     if(DVMP_VMPACKER_NO_VECTORIZE_HOT)
       set_source_files_properties(
         "${DVMP_ROOT}/dvmp_vm.c"
-        PROPERTIES COMPILE_OPTIONS "-fno-vectorize;-fno-slp-vectorize")
+        PROPERTIES COMPILE_OPTIONS
+        "-fno-vectorize;-fno-slp-vectorize;-mgeneral-regs-only")
     endif()
   endif()
 endif()
@@ -279,6 +296,7 @@ if(NOT WIN32 AND NOT MSVC)
     dartvmp_code_chunk_probe;
     dartvmp_code_residue;
     dartvmp_sha256_probe;
+    dartvmp_wire_probe;
     dartvmp_instrumented_probe;
     dartvmp_integrity_probe;
     dartvmp_guard_probe;

@@ -331,7 +331,49 @@ always_inline is what removes it, and `llvm-nm` is how you check.
 "@
 }
 
-# ---- instruction-coverage check -----------------------------------------
+# ---- the clone check -----------------------------------------------------
+#
+# A target must exist exactly once. `-O2` is allowed to keep a *second* copy of it
+# under a suffixed name - `foo.specialized.1` (interprocedural constant propagation
+# cloned it for one call site), `foo.constprop.0`, `foo.isra.0`, `foo.part.0`,
+# `foo.cold` (the cold half split out) - and VMPacker will happily virtualize `foo`
+# while every suffixed copy stays plain AArch64.
+#
+# That is the same failure as the helper check above, reached by a different road, and
+# it happened: giving `unpermute_code` two extra out-parameters, one call site passing
+# NULL and one passing pointers, made clang constant-propagate the NULL checks away and
+# emit `unpermute_code.specialized.1` beside it. VMPacker reported "Translated:
+# 229/229" and the trampoline was real; the copy next to it held the whole shuffle and
+# the whole walk in the clear. Two call sites of the same function therefore have to be
+# identical in shape.
+#
+# `.cold` is refused for a second reason: VMPacker 1.3 remaps only the branches inside
+# the function it translated, so a body with a branch into another function has an
+# `bl`-shaped problem (see the coverage check below).
+$cloneOwners = @($targets) + @($mustVanish)
+$clones = @()
+foreach ($owner in $cloneOwners) {
+  $prefix = "$owner."
+  $clones += @($before.Keys | Where-Object { $_.StartsWith($prefix) })
+}
+if ($clones.Count -gt 0) {
+  throw @"
+${InputSo} contains suffixed copies of its targets: $($clones -join ', ')
+
+Only the exact target names are virtualized. Every suffixed copy is the same code left
+in plain AArch64 beside the trampoline - either a clone the optimiser made for one call
+site (`foo.specialized.1`, `foo.constprop.0`, `foo.isra.0`) or a split-out piece of the
+body (`foo.part.0`, `foo.cold`), and a split-out piece is also a branch out of the
+translated function, which VMPacker's VM does not follow.
+
+Fix: make the call sites identical in shape. The clone that produced this check came
+from passing NULL out-parameters at one call site and real pointers at the other; both
+pass pointers now. If a split appears again, find what makes one path cold and remove
+the asymmetry rather than renaming the symbol.
+"@
+}
+
+
 #
 # THE CHECK THAT MATTERS MOST HERE, because it is the only one that can be made
 # before shipping rather than after crashing. VMPacker 1.3's VM does not reproduce
@@ -345,14 +387,17 @@ always_inline is what removes it, and `llvm-nm` is how you check.
 #         dvmp_body_tag   has `bl 0x6d60 <dvmp_fnv1a64>`   -> SIGSEGV at 0x6d60
 #         unpermute_code  has `bl 0x6dcc <dvmp_vm_set_error>` -> SIGSEGV at 0x6dcc
 #   * `ADRP`/`ADR`/`LDR ..pc` - PC-relative address materialisation, which every read
-#     of a global or a .rodata table needs. `permute_code` reads `kWidth[]` and no
-#     longer has any call at all, and it still dies (fault addr 0x0); the two targets
-#     that work on the device, `apply_keystream` and `keystream_seed`, are precisely
-#     the two whose instructions are all immediates, register moves and branches.
+#     of a global or a .rodata table needs. This is the check that refused the first
+#     version of `permute_code`: it read `kWidth[]` through an `adrp` and died at
+#     address 0 on the device, while the targets that worked were precisely the ones
+#     whose instructions are all immediates, register moves and branches. The table is
+#     gone (`op_width()` is a comparison chain over immediates) and the check passes.
 #
 # So: refuse a target that contains either, and say which instruction and where. This
-# is what turns "applied and structurally verified" into "safe to ship", and it is
-# why the default target list is two functions rather than seven.
+# is what turns "applied and structurally verified" into "safe to ship". It is also
+# deliberately blind to `CSEL`: that instruction translates and executes, and gets the
+# *wrong answer*, which no instruction-level check here can see - tool/vmpacker_targets.txt
+# records what it cost and how it was found (a device bisect, not this script).
 $objdump = Find-NdkTool 'llvm-objdump'
 if ($objdump) {
   $current = ''

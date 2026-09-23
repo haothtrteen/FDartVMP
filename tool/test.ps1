@@ -80,6 +80,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "build_native.ps1 exited $LASTEXITCODE" }
   }
 
+  Step 'operand widths match the assembler' {
+    # The runtime's `op_width()` and the assembler's `kOperandBytes` drive the same
+    # sequential walk from opposite ends, and a disagreement does not fail the walk -
+    # it desynchronises it. Compared through the runtime's own probe, for all 256 byte
+    # values, so the check covers the size of the opcode set as well as the widths.
+    # Reverse-verified: see tool/verify_wire_widths.py --negative-test and the note in
+    # tool/vmpacker_targets.txt.
+    & python (Join-Path $PSScriptRoot 'verify_wire_widths.py')
+    if ($LASTEXITCODE -ne 0) { throw 'the decoder and the assembler disagree about operand widths' }
+  }
+
   Step 'concurrency (native harness)' {
     # The runtime is one module and one interpreter shared by every thread in the
     # process. `flutter test` cannot drive that: spawning an isolate that dlopens

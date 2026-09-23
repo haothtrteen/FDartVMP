@@ -267,36 +267,58 @@ Blutter 不运行任何东西就能从 `libapp.so` 读到什么——而在那�
 攻击者接下来要做的是**读懂字节码**，而这以前很便宜：`dvmp_vm.c` 编出来就是一个可读的 switch，每个
 opcode 的语义写得明明白白。这一项本来要关掉的就是这一步。它关掉了一部分，而诚实的总结并不好听：
 
-**虚拟化只对最不值钱的两个函数有效，而对真正要紧的那些根本套不上。** 七个函数被虚拟化、套用过程干净、
-所有结构性检查全绿。然后受保护的 APK 装到真机上（root 的小米 12，Android 13，arm64-v8a），七个里有五个
-让应用起不来。逐个目标单独测的结果：
+**第一轮真机实测：虚拟化只对最不值钱的两个函数有效，真正要紧的那些根本套不上。第二轮把那五个里的
+三个救了回来。** 七个函数被虚拟化、套用过程干净、所有结构性检查全绿。然后受保护的 APK 装到真机上
+（root 的小米 12，Android 13，arm64-v8a），七个里有五个让应用起不来。逐个目标单独测、再逐个限制
+在我们自己的 C 层里修掉之后：
 
-| 目标 | 真机表现 | 原因 |
+| 目标 | 真机表现 | 原因 / 改了什么 |
 |---|---|---|
 | `keystream_seed` | **正确运行** | 无调用、无全局变量——4 条指令 |
 | `apply_keystream` | **正确运行** | 79 条指令：立即数、寄存器搬移、字节读写、分支 |
-| `permute_code` | SIGSEGV，`0x0` | 通过 `adrp` 读 `kWidth[]` 表 |
-| `unpermute_code` | SIGSEGV，`0x6dcc` | `bl dvmp_vm_set_error` |
-| `dvmp_body_tag` | SIGSEGV，`0x6d60` | `bl dvmp_fnv1a64` |
+| `permute_code` | **正确运行** | 原来死在 `0x0`：用 `adrp` 读 `kWidth[]` 表。表改成 `op_width()`（立即数比较链），`CSEL` 也必须去掉 |
+| `unpermute_code` | **正确运行** | 原来死在 `0x6dcc`，即 `bl dvmp_vm_set_error` 的地址；消息改由调用方格式化 |
+| `dvmp_body_tag` | **正确运行** | 原来死在 `0x6d60`，即 `bl dvmp_fnv1a64` 的地址；哈希内联（一份实现，两个视图） |
 | `dvmp_mask_keystream` | SIGSEGV | 调用 `dvmp_sha256`；并且有局部数组 |
 | `code_store_build` | SIGSEGV | 调用五个函数 |
 
-**出错地址本身就是诊断。** VMPacker 1.3 的 VM 只重定位它翻译的那个函数**内部**的分支，别的一概不管，
-所以一个外部 `bl` 会保留它的链接时地址，而 VM 跳过去时**没有加上库的加载基址**——这就是为什么出错地址
-**等于调用目标**：`llvm-objdump -d` 显示 `dvmp_fnv1a64` 在 `0x6d60`、`dvmp_vm_set_error` 在 `0x6dcc`，
-而进程恰好死在这两个地址上。`adrp`/`adr`/PC 相对寻址读全局变量是同一回事，所以**一条调用都没有**的
-`permute_code` 照样死。
+"正确运行"指的是**数值**，不是"没崩"：APK 装上去、启动、截屏，演示卡上的每个数字都与 Dart 预言机
+核对过——`add(20,22)=42`、`makeLicenseKey("demo-seed",7)=ZVEXKFVVCDH93W6R`、`verifyLicense` 对正确
+密钥为 true、改一个字符为 false、`deviceToken("pixel-7",1700000000)=-5031510683369134119`、
+`selfTest()=true`。这些调用都是经跳板派发的，而只要 `dvmp_body_tag`、`permute_code`、
+`unpermute_code` 三者中任何一个算得和 Dart 汇编器不一样，模块**根本打不开**。测试套件里的真机步骤
+只证明"没有崩溃记录"，所以这一项是另外用眼睛核对过的。
 
-于是 `tool/vmpacker_targets.txt` 现在只列两个目标，另外五个需要调用或 `adrp` 的挪进 `#+pcrel` 段，
-由 `tool/apply_vmpacker.ps1` 新增的**指令覆盖面检查**按名字和偏移拒绝。那个检查才是这一项真正的成果：
-真机 + tombstone + 二分花掉的时间，它一秒就能查出来。它反向验证过——对真实库确实会报，比如
+前三个的诊断是**出错地址**。VMPacker 1.3 的 VM 只重定位它翻译的那个函数**内部**的分支，别的一概
+不管，所以一个外部 `bl` 会保留它的链接时地址，而 VM 跳过去时**没有加上库的加载基址**——这就是为什么
+出错地址**等于调用目标**：`llvm-objdump -d` 显示 `dvmp_fnv1a64` 在 `0x6d60`、
+`dvmp_vm_set_error` 在 `0x6dcc`，而进程恰好死在这两个地址上。`adrp`/`adr`/PC 相对寻址读全局变量是
+同一回事，所以**一条调用都没有**的 `permute_code` 死在了 `0x0`。
+
+第四个没有任何出错地址，而它才是真正有意思的那个。调用、`adrp`、SIMD 都清掉之后，五个目标全部
+100% 翻译、APK 装得上、进程也不崩——但每一个受保护调用都失败在
+`opcode 0x20 out of range at +0`：解码走第一步就拒绝了指令流的首字节。用真机二分
+（`tool/bisect_vmpacker.ps1`，一次加一个目标）定位到 `unpermute_code`，再把它和三个已知正确的目标
+对比反汇编，指向了 `CSEL`：它在那里面出现两次（shuffle 的 `r % (256 - i)`，以及逆表 scatter 里的
+`i < DVMP_OP_MAX ? i : DVMP_OP_MAX` 选择），而那三个能跑的目标里一次都没有。VMPacker 的 VM **有**
+`CSEL` 处理器，所以这条指令算"支持"——它算错了。修法在我们这边而不是在工具里，因为流水线必须能用
+**未修改的发布版**跑通：shuffle 改用恒等式而不是取余（`r - ((r + i) >> 8) * (256 - i)`，因为
+`i < 38` 且 `r <= 255`，商恰好就是那个移位），逆表改成两次无条件 scatter。这是本项目里唯一一个
+**任何字节级检查都抓不到**的失败：它 100% 翻译、运行不崩，唯一的信号是一个算错的数字。
+
+于是 `tool/vmpacker_targets.txt` 现在列五个目标，剩下两个仍然需要调用，挪进 `#+pcrel` 段，由
+`tool/apply_vmpacker.ps1` 的**指令覆盖面检查**按名字和偏移拒绝。那个检查是第一轮真正的成果：真机 +
+tombstone + 二分花掉的时间，它一秒就能查出来。它反向验证过——对真实库确实会报，比如
 `+0x4428 bl 0x9624 <vmp_secure_alloc>`、`+0x4590 adrp x0, ...`（`code_store_build`）。
 
-**活下来的那两个目标值多少钱：不多，README 就该这么写。**
-`apply_keystream` 是用容器头部那个 seed 做密钥的 SplitMix64，`keystream_seed` 就是 `seed ^ 0xA5A5…`。
-两者在本文件上面都写得足够详细，照着就能重写。虚拟化它们，等于让攻击者多花十分钟写这两个函数。
-而**本该被藏住**的那个函数——`unpermute_code`，私有 opcode 映射——恰恰是带调用的那个，用这个工具根本
-虚拟化不了。真正保护映射的是第 7 项；这一项保护的是它自己逆运算的逆运算。
+**活下来的五个目标值多少钱：比那两个多，但仍然不是解释器。**
+`apply_keystream` 是用容器头部那个 seed 做密钥的 SplitMix64，`keystream_seed` 就是 `seed ^ 0xA5A5…`；
+两者在本文件上面都写得足够详细，照着就能重写，虚拟化它们等于让攻击者多花十分钟写这两个函数。回来的
+那三个是另一类目标：`permute_code` 和 `unpermute_code` 就是私有 opcode 映射本身，`dvmp_body_tag` 是
+容器的认证标签。想拿到它们，现在要么把构造重新实现一遍，要么逆 VMPacker 的字节码——"读一下反汇编就
+知道映射怎么来的"那条路没有了。**没变的是它下面那层**：`dvmp_vm.c` 仍然是可读的 AArch64，所以
+"读解释器就知道每个 opcode 干什么"依旧和以前一样便宜。映射的保密性仍然靠第 7 项；这一项提高的是
+另一条路线的成本。
 
 下面这一段记的是"套用"周围那三道检查是怎么来的，因为正是它们让目标清单可信，而每一道都是在亲眼看到
 它要抓的失败之后才写的：
@@ -667,9 +689,9 @@ dartvmp_demo.exe 126 KB，运行时已链入，9/9 受保护函数全绿
 做这件事的工具是 [VMPacker](https://github.com/bivex/VMPacker)（ARM64 ELF 虚拟化器）。
 它已经在本机从源码构建起来（`tool/build_vmpacker.ps1`：用 NDK 的 clang/ld.lld/objcopy 编出 VM 解释器
 stub——它 Makefile 里期待的 `aarch64-linux-gnu-` 其实并不需要——然后再编 Go 的 packer），
-由 `tool/apply_vmpacker.ps1` 套用。**两个函数被虚拟化并在真机上验证通过；五个被检查拒绝，因为工具能翻译
-它们、而它们随后会让应用崩溃。** 逐目标的证据、出错地址和推理都在
-[加强了什么](#加强了什么以及有意没做什么) 的第 1 项里；本节讲的是交接本身。
+由 `tool/apply_vmpacker.ps1` 套用。**五个函数被虚拟化并在真机上验证通过——按数值验证，不是按"没崩"；
+两个被检查拒绝，因为工具能翻译它们、而它们随后会让应用崩溃。** 逐目标的证据、出错地址、那个算错的
+`CSEL` 和推理都在 [加强了什么](#加强了什么以及有意没做什么) 的第 1 项里；本节讲的是交接本身。
 
 交接里大部分是检查，因为按名字找函数的工具**失败得很安静**：找不到匹配符号时它无事可做，而"无事可做"
 和"成功"长得一模一样。下面每个分支都反向验证过——每一个都是在亲眼看到它要抓的失败之后写的：
@@ -682,6 +704,7 @@ stub——它 Makefile 里期待的 `aarch64-linux-gnu-` 其实并不需要—�
 | 目标名已不存在（被内联掉） | 拒绝，并指出要用 `-DDVMP_VMPACKER=ON` |
 | 目标里有**调用**或读全局变量 | 拒绝，并报出指令和偏移：`+0x4428 bl 0x9624 <vmp_secure_alloc>` |
 | 目标的辅助函数留在外面 | 拒绝：`these helpers exist as separate functions in …: op_tables` |
+| 目标被编译器克隆出带后缀的副本 | 拒绝：`contains suffixed copies of its targets: unpermute_code.specialized.1`（真在交付物里出现过一次，反向验证用的就是那份产物） |
 | 只翻译了**一部分** | 拒绝：`translated these targets only partially: … 64/70` |
 | 工具退出 0 但**什么都没改** | 拒绝：逐个比对目标入口地址前后的字节 |
 | 工具真的改了 | `RESULT: APPLIED`，12 字节跳板，导出 ABI 前后都是 9 个 |
@@ -708,24 +731,29 @@ stub——它 Makefile 里期待的 `aarch64-linux-gnu-` 其实并不需要—�
 4. **带栈金丝雀的目标不是目标。** NDK 默认带 `-fstack-protector-strong`，而 VMPacker 的 VM 不复现读
    金丝雀的那次 TLS 访问，所以 `DVMP_VMPACKER_TARGET` 带上了 `no_stack_protector`。见第 1 项。
 
-目标清单是设计的另一半，而它现在只有两项而不是八项：
+目标清单是设计的另一半，而它现在有**五**项而不是八项：
 
 ```
-已虚拟化、真机验证通过    apply_keystream, keystream_seed
-拒绝：需要调用或 adrp     dvmp_body_tag, permute_code, unpermute_code,
-                          dvmp_mask_keystream, code_store_build
+已虚拟化、真机验证通过    apply_keystream, keystream_seed, dvmp_body_tag,
+                          permute_code, unpermute_code
+拒绝：需要调用            dvmp_mask_keystream, code_store_build
 有意不作为目标            dvmp_vm_run（指令循环）
                           dvmp_code_ensure（每条指令调一次）
 ```
 
+第一行中间那三个是第二轮的工作：每一个都是从拒绝列里搬出来的，办法是把 VMPacker 处理不了的构造从
+**我们自己的**源码里去掉——一次调用、一个 `adrp`、SIMD 寄存器流量，最后一个是不崩但**算错**的
+`CSEL`。这份记录住在 `tool/vmpacker_targets.txt` 里，而上面第 1 项的那张表是给读者看的部分。
+
 被 VMPacker 保护的函数跑在**第二台**解释器上，代价是按**调用**计的，而解释器循环正是唯一绝不能进去的
 函数：那等于在每一次受保护调用的每一条字节码指令上套一层 VM 套 VM。上一轮的常驻改造正好让这个划分变干净：
-每条指令的集合现在就只剩那两个函数，其余都冷到虚拟化本来可以白拿。拦住它的是**正确性**，不是代价。
+每条指令的集合现在就只剩五个函数，其余都冷到虚拟化本来可以白拿（**不**包括 `dvmp_mask_keystream`：
+它仍然是一次调用）。拦住 `dvmp_mask_keystream` 和 `code_store_build` 的是**正确性**，不是代价。
 
 还要说清楚的是：**VMPacker 改写的是 ELF，所以对 Windows 完全不适用。** 桌面运行时是被链进
 `dartvmp_demo.exe` 的 PE 镜像，那边的 C 层保持未虚拟化。这是只属于 Android 的加固步骤，所以 Windows
 构建里这些函数全都是普通的 x86_64 代码，正是第 1 项量出来的"可读"状态。这就是 C 层的诚实状态：
-Android 上两个函数——而且都不是要紧的那个；桌面上零个。
+Android 上五个（含指令流映射和容器标签），桌面上零个；而**解释器本身在两边都是可读的**。
 
 ### 发布加固
 
